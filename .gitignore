@@ -1,0 +1,21 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*~
+.idea/
+.vscode/
+
+# Secrets & credentials — never commit
+*.env
+.env*
+*token*
+*secret*
+*credentials*
+*.key
+*.pem
+
+# Data exports — never commit patient data
+*_records*.csv
+*export*.csv
+*.sav
+*.dta

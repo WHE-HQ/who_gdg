@@ -1,0 +1,79 @@
+/*-- scss:defaults --*/
+// WHO visual identity: logo blue + navy text, Arial (WHO's standard office font)
+$who-blue:   #009ADE;
+$who-navy:   #00205C;
+$who-light:  #E6F5FC;
+
+$primary:   $who-blue;
+$secondary: $who-navy;
+$info:      #5BC2E7;
+$success:   #80BC00;
+$warning:   #F2A900;
+$danger:    #E4572E;
+
+$body-bg:    #F4F7FA;
+$body-color: #1F2A44;
+$headings-color: $who-navy;
+$link-color: #0072BC;
+
+$font-family-sans-serif: Arial, "Helvetica Neue", Helvetica, sans-serif;
+$web-font-path: false;   // skip the Google Fonts import from the base theme
+
+$navbar-bg: $who-blue;
+$navbar-fg: #FFFFFF;
+$navbar-hl: #FFFFFF;
+
+$card-border-color: #DCE6EE;
+$card-cap-bg: #FFFFFF;
+
+/*-- scss:rules --*/
+.navbar {
+  box-shadow: 0 2px 6px rgba(0, 32, 92, .18);
+}
+.navbar .navbar-brand-container img.navbar-logo,
+.navbar img.navbar-logo {
+  max-height: 34px;
+  height: 34px;
+  width: auto;
+  margin-right: .75rem;
+  padding-right: .75rem;
+  border-right: 1px solid rgba(255, 255, 255, .45);
+}
+.navbar .navbar-title { font-weight: 700; letter-spacing: .2px; }
+.navbar .nav-link.active { border-bottom: 3px solid #FFFFFF; }
+
+.card {
+  border-radius: 6px;
+  box-shadow: 0 1px 2px rgba(0, 32, 92, .06);
+}
+.card-header {
+  color: $who-navy;
+  font-weight: 700;
+  border-bottom: 2px solid $who-blue;
+}
+
+// value boxes: white cards with a WHO-blue accent instead of solid colour blocks
+.bslib-value-box {
+  border-left: 5px solid $who-blue !important;
+  background: #FFFFFF !important;
+  color: $who-navy !important;
+}
+.bslib-value-box .value-box-title { color: #4A5873 !important; font-size: .9rem; }
+.bslib-value-box .value-box-value { color: $who-navy !important; font-weight: 700; }
+.bslib-value-box .value-box-showcase { color: $who-blue !important; opacity: .9; }
+.bslib-value-box.vb-navy  { border-left-color: $who-navy !important; }
+.bslib-value-box.vb-green { border-left-color: #80BC00 !important; }
+.bslib-value-box.vb-amber { border-left-color: #F2A900 !important; }
+
+.who-note { font-size: .85rem; color: #4A5873; }
+.who-badge {
+  display: inline-block; padding: .1rem .45rem; border-radius: 3px;
+  background: $who-light; color: $who-navy; font-size: .8rem; font-weight: 600;
+}
+
+table.dataTable thead th { background: $who-navy; color: #FFFFFF; }
+table.dataTable thead input { color: $body-color; }
+.dt-buttons .dt-button, .dt-buttons .btn {
+  background: $who-blue !important; color: #FFFFFF !important;
+  border: none !important; border-radius: 4px !important; font-weight: 600;
+}

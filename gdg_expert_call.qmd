@@ -1,0 +1,531 @@
+---
+title: "Call for Clinical Guideline Experts"
+author: "WHO Clinical Management & Operations"
+format:
+  dashboard:
+    theme: [cosmo, who.scss]
+    logo: assets/who-logo-white.png
+    orientation: rows
+    scrolling: true
+    embed-resources: true
+    nav-buttons:
+      - icon: envelope
+        href: mailto:chaillona@who.int
+        aria-label: Contact
+params:
+  data_dir: "data"          # folder holding dated snapshot sub-folders (data/2026-10-18/...)
+  snapshot: ""              # "" = most recent dated sub-folder; or e.g. "2026-10-18"
+  show_personal: true       # false = no names / e-mails / free text (use for anything public)
+  seats_per_gdg: 20         # target GDG size per guideline (from the call text)
+  deadline: "2026-10-19 23:59"
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+
+suppressPackageStartupMessages({
+  library(data.table); library(plotly); library(DT); library(htmltools); library(bslib)
+})
+
+WHO <- c(blue = "#009ADE", navy = "#00205C", sky = "#5BC2E7", green = "#80BC00",
+         orange = "#F26829", purple = "#A6228C", amber = "#F2A900", grey = "#8A94A6")
+PAL <- unname(WHO[c("blue", "navy", "sky", "green", "orange", "purple", "amber", "grey")])
+REGION_NAMES <- c(AFR = "African", AMR = "Americas", SEAR = "South-East Asia",
+                  EUR = "European", EMR = "Eastern Mediterranean", WPR = "Western Pacific")
+
+# ---- locate the snapshot -----------------------------------------------------
+root <- params$data_dir
+snaps <- list.dirs(root, recursive = FALSE)
+snaps <- snaps[grepl("^\\d{4}-\\d{2}-\\d{2}$", basename(snaps))]
+data_dir <- if (nzchar(params$snapshot)) file.path(root, params$snapshot) else
+  if (length(snaps)) sort(snaps, decreasing = TRUE)[1] else root
+snapshot <- basename(data_dir)
+
+struct_file <- list.files(data_dir, "^limesurvey_survey_.*\\.txt$", full.names = TRUE)[1]
+resp_files  <- list.files(data_dir, "\\.(csv|tsv|xlsx|xls)$", full.names = TRUE, ignore.case = TRUE)
+if (is.na(struct_file)) stop("No limesurvey_survey_*.txt structure file in ", data_dir)
+if (!length(resp_files)) stop("No response export (.csv / .xlsx) in ", data_dir)
+resp_file <- resp_files[which.max(file.mtime(resp_files))]
+
+# ---- survey structure: code -> label maps --------------------------------------
+strip_html <- function(x) trimws(gsub("\\s+", " ", gsub("<[^>]+>", " ", x)))
+s <- fread(struct_file, sep = "\t", quote = "\"", colClasses = "character", fill = TRUE,
+           encoding = "UTF-8", select = c("class", "type/scale", "name", "text"))
+setnames(s, "type/scale", "qtype")
+answers <- list(); subq <- list(); qtext <- character(); cur <- NA_character_
+for (i in seq_len(nrow(s))) {
+  cl <- s$class[i]; nm <- s$name[i]; tx <- strip_html(s$text[i])
+  if (cl == "Q") { cur <- nm; qtext[nm] <- tx }
+  else if (cl == "A"  && !is.na(cur)) answers[[cur]][nm] <- tx
+  else if (cl == "SQ" && !is.na(cur)) subq[[cur]][nm] <- tx
+}
+# The form lists age band AO05 as "50–69", overlapping "60–69": almost certainly a typo for 50–59.
+age_fix <- identical(unname(answers$G02Q05["AO05"]), "50\u201369")
+if (age_fix) answers$G02Q05["AO05"] <- "50\u201359*"
+
+# ---- responses ---------------------------------------------------------------
+d <- if (grepl("\\.xlsx?$", resp_file, ignore.case = TRUE)) {
+  as.data.table(readxl::read_excel(resp_file, col_types = "text"))
+} else {
+  fread(resp_file, colClasses = "character", encoding = "UTF-8",
+        na.strings = c("", "NA"), check.names = FALSE)
+}
+nm <- sub("^\ufeff", "", names(d))
+nm <- sub("^([A-Za-z0-9_]+(\\[[^]]*\\])?)\\.\\s.*$", "\\1", nm)   # "CODE. question text" headings
+nm <- sub("^([A-Za-z][A-Za-z0-9]*)\\[([A-Za-z0-9_]+)\\]$", "\\1_\\2", nm)  # G01Q22[SQ001] -> G01Q22_SQ001
+nm <- trimws(nm)
+std <- c("Response ID" = "id", "Date submitted" = "submitdate", "Last page" = "lastpage",
+         "Date started" = "startdate", "Date last action" = "datestamp")
+nm[nm %in% names(std)] <- std[nm[nm %in% names(std)]]
+
+# --- headings written as question text instead of codes ------------------------------
+# LimeSurvey can export "Full/abbreviated question text" headings, e.g.
+#   "Which guideline(s) (one or more): [Sepsis]", "filecount - Please upload your CV ...".
+# Map those back to codes using the question texts from the structure file.
+norm <- function(x) gsub("[^a-z0-9]", "", tolower(strip_html(x)))
+qrows <- s[class == "Q"]
+E <- rbindlist(lapply(seq_len(nrow(qrows)), function(i) {
+  q <- qrows$name[i]; qt <- norm(strip_html(qrows$text[i]))
+  rows <- list(data.table(code = q, qn = qt, sn = ""))
+  if (!is.null(subq[[q]])) rows <- c(rows, list(
+    data.table(code = paste0(q, "_", names(subq[[q]])), qn = qt, sn = norm(subq[[q]])),
+    data.table(code = paste0(q, "_other"), qn = qt, sn = "other")))
+  if (identical(qrows$qtype[i], "|")) rows <- c(rows, list(data.table(code = paste0(q, "_filecount"), qn = paste0("filecount", qt), sn = "")))
+  rbindlist(rows)
+}))
+known <- c(E$code, "id", "submitdate", "lastpage", "startdate", "datestamp", "startlanguage", "seed", "token", "refurl", "ipaddr")
+for (j in which(!nm %in% known)) {
+  h <- nm[j]; sub_h <- ""
+  m <- regmatches(h, regexec("^(.*?)\\s*\\[([^]]*)\\]\\s*$", h))[[1]]
+  if (length(m)) { h <- m[2]; sub_h <- m[3] }
+  hn <- norm(sub("^filecount\\s*-\\s*", "filecount", h)); want <- norm(sub_h)
+  if (nchar(hn) < 6) next
+  hit <- E[sn == want & (startsWith(qn, hn) | startsWith(hn, qn)) & !code %in% nm]
+  if (nrow(hit)) nm[j] <- hit$code[1]
+}
+setnames(d, nm)
+need <- c("Q1", "G01Q14", "G02Q06", "G01Q22_SQ001")
+if (!all(need %in% names(d))) stop(
+  "Could not find the question columns in ", basename(resp_file), " (missing: ",
+  paste(setdiff(need, names(d)), collapse = ", "), ").\nColumn headings seen: ",
+  paste(head(names(d), 40), collapse = " | "),
+  "\nRe-export from LimeSurvey with 'Question code' headings, or send these headings over.")
+
+g <- function(code) if (code %in% names(d)) as.character(d[[code]]) else rep(NA_character_, nrow(d))
+blank <- function(x) is.na(x) | trimws(x) == ""
+decode <- function(x, q) { lab <- answers[[q]]; i <- !blank(x) & x %in% names(lab); x[i] <- lab[x[i]]; x[blank(x)] <- NA; x }
+picked <- function(x) { x <- toupper(trimws(x)); !is.na(x) & x != "" & !x %in% c("N", "NO", "0", "FALSE", "NOT SELECTED") }
+yn <- function(x) { x <- toupper(trimws(x)); fifelse(x %in% c("Y", "YES"), "Yes", fifelse(x %in% c("N", "NO"), "No", NA_character_)) }
+has_file <- function(code) {
+  fc <- suppressWarnings(as.numeric(g(paste0(code, "_filecount"))))
+  js <- g(code)
+  (!is.na(fc) & fc > 0) | (!blank(js) & nchar(js) > 2 & trimws(js) != "[]")
+}
+parse_dt <- function(x) {
+  x <- trimws(x); x[x == ""] <- NA
+  out <- suppressWarnings(as.POSIXct(x, tz = "UTC", optional = TRUE,
+           tryFormats = c("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M", "%d/%m/%Y %H:%M", "%Y-%m-%d")))
+  num <- suppressWarnings(as.numeric(x)); k <- is.na(out) & !is.na(num)          # Excel serial dates
+  out[k] <- as.POSIXct(num[k] * 86400, origin = "1899-12-30", tz = "UTC")
+  out
+}
+multi <- function(q) {                                   # multiple-choice -> logical matrix
+  sq <- subq[[q]]
+  m <- vapply(names(sq), function(k) picked(g(paste0(q, "_", k))), logical(nrow(d)))
+  if (is.null(dim(m))) m <- matrix(m, nrow = nrow(d))
+  colnames(m) <- unname(sq); m
+}
+collapse <- function(m, extra = NULL) {
+  out <- apply(m, 1, function(r) paste(colnames(m)[r], collapse = "; "))
+  if (!is.null(extra)) out <- ifelse(blank(extra), out, ifelse(out == "", extra, paste0(out, "; ", extra)))
+  out[out == ""] <- NA; out
+}
+ord <- function(x, q) factor(x, levels = unname(answers[[q]]))
+
+GL <- multi("G01Q22"); gl_names <- colnames(GL)
+EX <- multi("G01Q17"); QU <- multi("G01Q23")
+countries <- fread("assets/who_countries.csv", encoding = "UTF-8")
+
+started  <- parse_dt(g("startdate"))
+submitted <- parse_dt(g("submitdate"))
+is_complete <- if ("submitdate" %in% names(d)) !is.na(submitted) else rep(TRUE, nrow(d))
+
+gender <- decode(g("G02Q06"), "G02Q06")
+position <- decode(g("G01Q16"), "G01Q16")
+position_full <- ifelse(!blank(g("G01Q21")), paste0(position, " (", g("G01Q21"), ")"), position)
+email_col <- grep("e-?mail", names(d), ignore.case = TRUE, value = TRUE)[1]
+
+a <- data.table(
+  .orig     = seq_len(nrow(d)),
+  id        = g("id"),
+  complete  = is_complete,
+  lastpage  = g("lastpage"),
+  started   = started,
+  submitted = submitted,
+  family    = trimws(g("G01Q14")),
+  first     = trimws(g("G01Q15")),
+  email     = if (!is.na(email_col)) g(email_col) else NA_character_,
+  guidelines = collapse(GL),
+  country   = decode(g("Q1"), "Q1"),
+  gender    = gender,
+  gender_txt = ifelse(!blank(g("G01Q25")), paste0(gender, ": ", g("G01Q25")), gender),
+  age       = ord(sub("^50\u201369$", "50\u201359*", decode(g("G02Q05"), "G02Q05")), "G02Q05"),
+  position  = position,
+  position_full = position_full,
+  experience = collapse(EX, g("G01Q24")),
+  years     = ord(decode(g("G01Q18"), "G01Q18"), "G01Q18"),
+  qualifications = collapse(QU, g("G01Q23_other")),
+  humanitarian = yn(g("G01Q29")),
+  prior_gdg    = yn(g("G01Q19")),
+  local_gl     = yn(g("G01Q28")),
+  other_who    = yn(g("G01Q20")),
+  cv  = has_file("G01Q26"),
+  doi = has_file("G01Q04"),
+  cu  = has_file("G02Q21"),
+  motivation = g("G01Q01")
+)
+a <- merge(a, countries, by = "country", all.x = TRUE, sort = FALSE)
+setorder(a, .orig)                                   # keep export order, aligned with GL/EX/QU
+a[, region := factor(who_region, levels = names(REGION_NAMES))]
+# possible duplicate = same name + same country, or same e-mail, among complete applications
+a[, name_key := paste(tolower(gsub("[^[:alpha:]]", "", paste(family, first))), country)]
+a[, mail_key := tolower(trimws(email))]
+dup <- function(k) !blank(k) & (duplicated(k) | duplicated(k, fromLast = TRUE))
+a[, duplicate := FALSE]
+a[complete == TRUE, duplicate := dup(name_key) | dup(mail_key)]
+ok <- a$complete
+ap <- a[ok]; GLc <- GL[ok, , drop = FALSE]; EXc <- EX[ok, , drop = FALSE]; QUc <- QU[ok, , drop = FALSE]
+
+# ---- headline figures ------------------------------------------------------------
+n_started  <- nrow(a)
+n_complete <- nrow(ap)
+pct <- function(x, n = length(x)) if (n == 0) "\u2013" else paste0(round(100 * sum(x, na.rm = TRUE) / n), "%")
+n_countries <- uniqueN(na.omit(ap$country))
+n_regions   <- uniqueN(na.omit(ap$who_region))
+seats <- params$seats_per_gdg
+deadline <- as.POSIXct(params$deadline, tz = "Europe/Zurich")
+days_left <- ceiling(as.numeric(difftime(deadline, Sys.time(), units = "days")))
+
+vb <- function(title, value, sub = NULL, icon = "people", cls = NULL) {
+  value_box(title = title, value = value, showcase = tags$i(class = paste0("bi bi-", icon)), showcase_layout = showcase_top_right(width = 0.25),
+            if (!is.null(sub)) p(sub), class = cls, theme = NULL)
+}
+plt <- function(p) config(p, displaylogo = FALSE,
+  modeBarButtonsToRemove = c("lasso2d", "select2d", "autoScale2d", "zoomIn2d", "zoomOut2d", "pan2d", "zoom2d"))
+lay <- function(p, ..., margin = list(l = 10, r = 10, t = 10, b = 10))
+  layout(p, font = list(family = "Arial", color = "#1F2A44", size = 12),
+         paper_bgcolor = "rgba(0,0,0,0)", plot_bgcolor = "rgba(0,0,0,0)", margin = margin, ...)
+hbar <- function(labels, values, color = WHO["blue"], total = n_complete) {
+  o <- order(values); lab <- labels[o]; v <- values[o]
+  plot_ly(x = v, y = factor(lab, levels = lab), type = "bar", orientation = "h",
+          marker = list(color = color), text = paste0(v, " (", round(100 * v / max(total, 1)), "%)"),
+          textposition = "auto", cliponaxis = FALSE, hovertemplate = "%{y}: %{x}<extra></extra>") |>
+    lay(xaxis = list(title = "", showgrid = TRUE, gridcolor = "#E3E9F0"), yaxis = list(title = "")) |> plt()
+}
+```
+
+# Overview
+
+## Row {height="auto"}
+
+```{r}
+layout_column_wrap(
+  width = "200px", fill = FALSE,
+  vb("Complete applications", n_complete, paste0(n_started, " started \u00b7 ", pct(ok), " completed"), "person-check"),
+  vb("Countries", n_countries, paste0(n_regions, " of 6 WHO regions"), "globe2", "vb-navy"),
+  vb("Women", pct(ap$gender == "Female"), paste0(sum(ap$gender == "Female", na.rm = TRUE), " applicants"), "gender-female", "vb-navy"),
+  vb("Lived experience", sum(EXc[, "Person with lived experience"]), "persons with lived experience", "heart-pulse", "vb-green"),
+  vb("CV + DOI uploaded", pct(ap$cv & ap$doi), "documentation complete", "file-earmark-check", "vb-green"),
+  vb(if (days_left >= 0) "Days to deadline" else "Call closed", if (days_left >= 0) days_left else format(deadline, "%d %b"),
+     paste("Deadline", format(deadline, "%d %b %Y %H:%M"), "Geneva"), "calendar-event", "vb-amber")
+)
+```
+
+## Row {height="auto"}
+
+```{r}
+do.call(layout_column_wrap, c(list(width = "260px", fill = FALSE),
+  lapply(gl_names, function(gn) {
+    n <- sum(GLc[, gn])
+    vb(gn, n, sprintf("%.1f applicants per seat (target %d)", n / seats, seats), "clipboard2-pulse")
+  })))
+```
+
+## Row {height=420}
+
+```{r}
+#| title: Applications over time
+ts <- ap[!is.na(submitted), .N, by = .(day = as.Date(submitted))][order(day)]
+if (nrow(ts)) {
+  ts[, cum := cumsum(N)]
+  plot_ly(ts, x = ~day) |>
+    add_bars(y = ~N, name = "Per day", marker = list(color = WHO["sky"]),
+             hovertemplate = "%{x|%d %b}: %{y}<extra></extra>") |>
+    add_lines(y = ~cum, name = "Cumulative", yaxis = "y2", line = list(color = WHO["navy"], width = 3),
+              hovertemplate = "Total by %{x|%d %b}: %{y}<extra></extra>") |>
+    lay(xaxis = list(title = ""), yaxis = list(title = "Per day", gridcolor = "#E3E9F0"),
+        yaxis2 = list(title = "Cumulative", overlaying = "y", side = "right", showgrid = FALSE, rangemode = "tozero"),
+        legend = list(orientation = "h", y = 1.1), margin = list(l = 10, r = 55, t = 30, b = 10),
+        shapes = list(list(type = "line", x0 = as.Date(deadline), x1 = as.Date(deadline), y0 = 0, y1 = 1,
+                           yref = "paper", line = list(color = WHO["orange"], dash = "dot"))),
+        annotations = list(list(x = as.Date(deadline), y = 1, yref = "paper", text = "Deadline",
+                                showarrow = FALSE, xanchor = "right", font = list(color = WHO["orange"])))) |> plt()
+} else p("No submission dates in this export.")
+```
+
+```{r}
+#| title: Applicants by guideline and WHO region
+long <- rbindlist(lapply(gl_names, function(gn) ap[GLc[, gn], .(guideline = gn, region)]))
+long[, region := factor(ifelse(is.na(region), "Unknown", as.character(region)), levels = c(names(REGION_NAMES), "Unknown"))]
+tab <- long[, .N, by = .(guideline, region)]
+p <- plot_ly()
+for (k in seq_along(levels(tab$region))) {
+  r <- levels(tab$region)[k]; t <- tab[region == r]
+  if (nrow(t)) p <- add_bars(p, data = t, x = ~N, y = ~guideline, name = r, orientation = "h",
+                             marker = list(color = c(PAL, "#C7CED9")[k]),
+                             hovertemplate = paste0(r, ": %{x}<extra>%{y}</extra>"))
+}
+p |> lay(barmode = "stack", xaxis = list(title = "", gridcolor = "#E3E9F0"),
+         yaxis = list(title = "", categoryorder = "array", categoryarray = rev(gl_names)),
+         legend = list(orientation = "h", y = -0.12, traceorder = "normal")) |> plt()
+```
+
+## Row {height=360}
+
+```{r}
+#| title: Gender by guideline
+gtab <- rbindlist(lapply(gl_names, function(gn) ap[GLc[, gn], .N, by = .(gender)][, guideline := gn]))
+gtab[is.na(gender), gender := "Not answered"]
+gtab[, share := N / sum(N), by = guideline]
+gcol <- c(Female = WHO[["blue"]], Male = WHO[["navy"]], "Prefer not to specify" = "#C7CED9",
+          "Prefer to specify" = WHO[["purple"]], "Not answered" = "#E3E9F0")
+p <- plot_ly()
+for (gg in intersect(names(gcol), unique(gtab$gender))) {
+  t <- gtab[gender == gg]
+  p <- add_bars(p, data = t, x = ~share, y = ~guideline, name = gg, orientation = "h",
+                marker = list(color = gcol[[gg]]), text = ~paste0(round(100 * share), "%"),
+                textposition = "inside", hovertemplate = paste0(gg, ": %{customdata} (%{x:.0%})<extra>%{y}</extra>"),
+                customdata = ~N)
+}
+p |> lay(barmode = "stack", uniformtext = list(minsize = 10, mode = "hide"),
+         xaxis = list(title = "", tickformat = ".0%", range = c(0, 1)),
+         yaxis = list(title = "", categoryorder = "array", categoryarray = rev(gl_names)),
+         legend = list(orientation = "h", y = -0.2, traceorder = "normal")) |> plt()
+```
+
+```{r}
+#| title: Age group
+at <- ap[!is.na(age), .N, by = age][order(age)]
+plot_ly(at, x = ~age, y = ~N, type = "bar", marker = list(color = WHO["blue"]), text = ~N, textposition = "outside", cliponaxis = FALSE,
+        hovertemplate = "%{x}: %{y}<extra></extra>") |>
+  lay(xaxis = list(title = ""), yaxis = list(title = "", gridcolor = "#E3E9F0", range = c(0, max(at$N) * 1.15))) |> plt()
+```
+
+```{r}
+#| title: Years of experience
+yt <- ap[!is.na(years), .N, by = years][order(years)]
+plot_ly(yt, x = ~years, y = ~N, type = "bar", marker = list(color = WHO["navy"]), text = ~N, textposition = "outside", cliponaxis = FALSE,
+        hovertemplate = "%{x} years: %{y}<extra></extra>") |>
+  lay(xaxis = list(title = ""), yaxis = list(title = "", gridcolor = "#E3E9F0", range = c(0, max(yt$N) * 1.15))) |> plt()
+```
+
+# Map
+
+## Row {height=560}
+
+```{r}
+#| title: Where applicants are based
+mk <- function(sel) ap[sel & !is.na(iso3), .N, by = .(iso3, country)]
+sets <- c(list(`All guidelines` = rep(TRUE, n_complete)), setNames(lapply(gl_names, function(gn) GLc[, gn]), gl_names))
+zmax <- max(1, mk(rep(TRUE, n_complete))$N)
+p <- plot_ly()
+for (k in seq_along(sets)) {
+  t <- mk(sets[[k]])
+  p <- add_trace(p, type = "choropleth", locations = t$iso3, z = t$N, text = t$country,
+                 locationmode = "ISO-3", name = names(sets)[k], visible = k == 1, zmin = 0, zmax = zmax,
+                 colorscale = list(c(0, "#D6EEF9"), c(0.35, "#5BC2E7"), c(0.7, "#009ADE"), c(1, "#00205C")),
+                 marker = list(line = list(color = "#FFFFFF", width = 0.5)),
+                 colorbar = list(title = "Applicants", thickness = 12, len = 0.6),
+                 hovertemplate = "%{text}: %{z}<extra></extra>")
+}
+btns <- lapply(seq_along(sets), function(k) list(label = names(sets)[k], method = "restyle",
+                                                 args = list("visible", as.list(seq_along(sets) == k))))
+p |> lay(geo = list(projection = list(type = "natural earth"), showframe = FALSE, showcoastlines = FALSE,
+                    showland = TRUE, landcolor = "#ECEFF3", countrycolor = "#FFFFFF", showcountries = TRUE,
+                    bgcolor = "rgba(0,0,0,0)", lataxis = list(range = c(-58, 85))),
+         updatemenus = list(list(type = "buttons", direction = "right", x = 0, y = 1.07, xanchor = "left",
+                                 buttons = btns, bgcolor = "#FFFFFF", bordercolor = WHO["blue"])),
+         margin = list(l = 0, r = 0, t = 30, b = 0)) |> plt()
+```
+
+## Row {height=420}
+
+```{r}
+#| title: By WHO region
+rt <- rbindlist(lapply(c("All", gl_names), function(gn) {
+  sel <- if (gn == "All") rep(TRUE, n_complete) else GLc[, gn]
+  ap[sel, .N, by = region][, guideline := gn]
+}))
+rt[, region_lab := ifelse(is.na(region), "Unknown", paste0(REGION_NAMES[as.character(region)], " (", region, ")"))]
+w <- dcast(rt, region_lab ~ guideline, value.var = "N", fill = 0)
+for (gn in setdiff(c("All", gl_names), names(w))) set(w, j = gn, value = 0L)
+setcolorder(w, c("region_lab", "All", gl_names)); setnames(w, "region_lab", "WHO region")
+setorderv(w, "All", -1)
+datatable(w, rownames = FALSE, options = list(dom = "t", paging = FALSE, ordering = FALSE),
+          class = "compact stripe") |>
+  formatStyle(c("All", gl_names), background = styleColorBar(c(0, max(w$All)), "#BFE6F7"),
+              backgroundSize = "95% 70%", backgroundRepeat = "no-repeat", backgroundPosition = "center")
+```
+
+```{r}
+#| title: By country
+ct <- ap[, .(Applicants = .N), by = .(Country = country, Region = who_region)][order(-Applicants)]
+for (gn in gl_names) ct[ap[GLc[, gn], .N, by = .(Country = country)], (gn) := i.N, on = "Country"]
+for (gn in gl_names) set(ct, which(is.na(ct[[gn]])), gn, 0L)
+datatable(ct, rownames = FALSE, class = "compact stripe",
+          options = list(pageLength = 12, dom = "ftip", scrollY = "300px", paging = FALSE))
+```
+
+# Applicants
+
+## Row {height=780}
+
+```{r}
+#| title: !expr paste0("Complete applications (", n_complete, ")", if (!params$show_personal) " \u2014 personal data hidden" else "")
+tbl <- ap[order(-as.numeric(submitted))][, .(
+  ID = id,
+  Submitted = format(submitted, "%Y-%m-%d %H:%M"),
+  `Family name` = family, `First name` = first, Email = email,
+  `Guideline(s)` = guidelines, Country = country, `WHO region` = who_region,
+  Position = position_full, `Experience areas` = experience, `Years exp.` = as.character(years),
+  Gender = gender_txt, `Age group` = as.character(age), Qualifications = qualifications,
+  Humanitarian = humanitarian, `Prior WHO GDG` = prior_gdg, `Other WHO group` = other_who,
+  `Local guideline work` = local_gl,
+  CV = fifelse(cv, "Yes", "No"), DOI = fifelse(doi, "Yes", "No"), `Confidentiality` = fifelse(cu, "Yes", "No"),
+  `Possible duplicate` = fifelse(duplicate, "Yes", ""),
+  Motivation = motivation)]
+if (all(is.na(tbl$Email))) tbl[, Email := NULL]
+if (!params$show_personal) tbl[, intersect(c("Family name", "First name", "Email", "Motivation", "Gender"), names(tbl)) := NULL]
+
+long_cols <- which(names(tbl) %in% c("Motivation", "Experience areas", "Qualifications")) - 1
+fname <- paste0("GDG_expert_applications_", snapshot)
+datatable(
+  tbl, rownames = FALSE, filter = "top", extensions = "Buttons", fillContainer = TRUE,
+  class = "compact stripe hover nowrap",
+  options = list(
+    dom = "Bfrtip", pageLength = 50, scrollX = TRUE, scrollY = "520px", scrollCollapse = TRUE,
+    buttons = list(
+      list(extend = "csv",   text = "\u2b07 CSV",   filename = fname, exportOptions = list(orthogonal = "export")),
+      list(extend = "excel", text = "\u2b07 Excel", filename = fname, title = "", exportOptions = list(orthogonal = "export")),
+      list(extend = "copy",  text = "Copy", exportOptions = list(orthogonal = "export"))),
+    columnDefs = list(list(targets = long_cols, render = JS(
+      "function(d, type) {",
+      "  if (d === null || d === undefined) return '';",
+      "  if (type !== 'display') return d;",
+      "  var s = String(d); var esc = s.replace(/&/g,'&amp;').replace(/\"/g,'&quot;').replace(/</g,'&lt;');",
+      "  return s.length > 60 ? '<span title=\"' + esc + '\">' + esc.substr(0, 60) + '\u2026</span>' : esc;",
+      "}")))
+  ),
+  escape = TRUE
+)
+```
+
+# Profiles
+
+## Row {height=380}
+
+```{r}
+#| title: Current position
+pt <- ap[!is.na(position), .N, by = position]
+hbar(pt$position, pt$N)
+```
+
+```{r}
+#| title: Areas of experience (multiple answers)
+hbar(colnames(EXc), colSums(EXc), WHO["navy"])
+```
+
+## Row {height=340}
+
+```{r}
+#| title: Professional qualifications (multiple answers)
+q <- colSums(QUc); q_other <- sum(!blank(g("G01Q23_other")[ok]))
+hbar(c(colnames(QUc), if (q_other) "Other"), c(q, if (q_other) q_other), WHO["sky"])
+```
+
+```{r}
+#| title: Experience with WHO / guideline processes
+yv <- list(`Humanitarian setting` = ap$humanitarian, `Prior WHO GDG member` = ap$prior_gdg,
+           `Other WHO expert group` = ap$other_who, `Local guideline development / adaptation` = ap$local_gl)
+yt <- rbindlist(lapply(names(yv), function(k) data.table(item = k, ans = c("Yes", "No"),
+                N = c(sum(yv[[k]] == "Yes", na.rm = TRUE), sum(yv[[k]] == "No", na.rm = TRUE)))))
+yt[, share := N / sum(N), by = item]
+plot_ly(yt[ans == "Yes"], x = ~share, y = ~item, type = "bar", orientation = "h", name = "Yes",
+        marker = list(color = WHO["green"]), text = ~paste0(N, " (", round(100 * share), "%)"), textposition = "inside",
+        hovertemplate = "%{y}: %{text}<extra>Yes</extra>") |>
+  add_bars(data = yt[ans == "No"], x = ~share, y = ~item, name = "No", marker = list(color = "#DCE3EB"),
+           text = ~paste0(N), textposition = "inside", hovertemplate = "%{y}: %{text}<extra>No</extra>") |>
+  lay(barmode = "stack", xaxis = list(title = "", tickformat = ".0%", range = c(0, 1)), yaxis = list(title = ""),
+      legend = list(orientation = "h", y = -0.2)) |> plt()
+```
+
+## Row {height="auto"}
+
+```{r}
+#| title: Composition by guideline (complete applications)
+comp <- rbindlist(lapply(gl_names, function(gn) {
+  s <- GLc[, gn]; x <- ap[s]; e <- EXc[s, , drop = FALSE]
+  r <- table(factor(x$who_region, levels = names(REGION_NAMES)))
+  data.table(Guideline = gn, Applicants = nrow(x), `Per seat` = round(nrow(x) / seats, 1),
+             Women = pct(x$gender == "Female"), Countries = uniqueN(na.omit(x$country)),
+             AFR = r[["AFR"]], AMR = r[["AMR"]], SEAR = r[["SEAR"]], EUR = r[["EUR"]], EMR = r[["EMR"]], WPR = r[["WPR"]],
+             `Lived exp.` = sum(e[, "Person with lived experience"]),
+             `Ethics / equity` = sum(e[, "Medical ethics and health equity"]),
+             Nurses = sum(e[, "Nurse"]),
+             `Prior GDG` = sum(x$prior_gdg == "Yes", na.rm = TRUE),
+             `CV + DOI` = pct(x$cv & x$doi))
+}))
+datatable(comp, rownames = FALSE, class = "compact stripe",
+          options = list(dom = "t", ordering = FALSE, scrollX = TRUE)) |>
+  formatStyle(c("AFR", "AMR", "SEAR", "EUR", "EMR", "WPR"),
+              backgroundColor = styleInterval(c(0, 2), c("#FDE2D6", "#FFF4D1", "transparent"))) |>
+  formatStyle("Lived exp.", backgroundColor = styleInterval(0, c("#FDE2D6", "transparent")))
+```
+
+# Data checks
+
+## Row {height="auto"}
+
+```{r}
+layout_column_wrap(
+  width = "220px", fill = FALSE,
+  vb("Incomplete / abandoned", sum(!a$complete), "started but not submitted", "hourglass-split", "vb-amber"),
+  vb("Possible duplicates", sum(ap$duplicate), "same name + country (or e-mail) more than once", "files", "vb-amber"),
+  vb("Missing DOI form", sum(!ap$doi), "complete applications without a DOI upload", "file-earmark-x", "vb-amber"),
+  vb("Missing CV", sum(!ap$cv), "complete applications without a CV", "file-earmark-x", "vb-amber")
+)
+```
+
+## Row {height=560}
+
+```{r}
+#| title: Records needing follow-up
+chk <- ap[duplicate | !cv | !doi | is.na(iso3), .(
+  ID = id, Submitted = format(submitted, "%Y-%m-%d %H:%M"),
+  Name = if (params$show_personal) paste(family, first) else "(hidden)",
+  Country = country,
+  Issue = gsub("^; |; $", "", gsub("(; )+", "; ", paste(fifelse(duplicate, "possible duplicate", ""), fifelse(!cv, "no CV", ""),
+                       fifelse(!doi, "no DOI", ""), fifelse(is.na(iso3), "country not matched", ""), sep = "; "))))][order(Name)]
+datatable(chk, rownames = FALSE, class = "compact stripe", extensions = "Buttons",
+          fillContainer = TRUE,
+          options = list(dom = "Bfrtip", paging = FALSE, scrollY = "380px", scrollCollapse = TRUE,
+                         buttons = list(list(extend = "csv", text = "\u2b07 CSV", filename = paste0("GDG_followup_", snapshot)),
+                                        list(extend = "excel", text = "\u2b07 Excel", filename = paste0("GDG_followup_", snapshot), title = ""))))
+```
+
